@@ -1,0 +1,82 @@
+x-app: &app
+  image: payments-app
+  build: .
+  restart: unless-stopped
+  environment: &app-env
+    API_KEY: ${API_KEY:-secret-api-key}
+    DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/payments
+    RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+  depends_on: &app-deps
+    postgres:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d payments"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672" # UI: guest / guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  migrate:
+    image: payments-app
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,urllib.request as u; u.urlopen(u.Request('http://localhost:8000/health', headers={'X-API-Key': os.environ['API_KEY']}))"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  consumer:
+    <<: *app
+    command: ["python", "-m", "app.consumer"]
+
+  # Демо-приёмник webhook: POST /hook -> 200, POST /fail -> 500 (см. README).
+  webhook-stub:
+    image: payments-app
+    build: .
+    command: ["python", "tools/webhook_stub.py"]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  rabbitmq_data:
